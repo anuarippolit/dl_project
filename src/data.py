@@ -18,7 +18,9 @@ SECONDS = {"esc10": 5, "sc": 1}
 
 SNRS = [20, 10, 0]
 CONDITIONS = ["clean"] + [f"{kind}_{snr}" for kind in ("white", "real") for snr in SNRS]
+EXTRA_CONDITIONS = [f"esc_{snr}" for snr in SNRS]
 REAL_NOISE = ["doing_the_dishes", "dude_miaowing", "exercise_bike", "running_tap"]
+ESC_NOISE_CLIPS = 300
 
 
 # function to load one wav file at 16 kHz
@@ -105,12 +107,46 @@ def get_split(name, fold=1, seed=0):
     return [(np.array(X[i]), y[i].astype(np.int64)) for i in (train, val, test)]
 
 
+# ESC-50 clips from classes that are not in ESC-10 (audio must be downloaded)
+def esc_noise_files():
+    df = pd.read_csv(ESC_ROOT / "meta" / "esc50.csv")
+    df = df[~df.esc10]
+    return [ESC_ROOT / "audio" / f for f in df.filename if (ESC_ROOT / "audio" / f).exists()]
+
+
+# bank of noise clips from ESC-50 classes that are not in ESC-10
+def esc_noise_bank(seed=0):
+    path = CACHE / "esc_noise.npy"
+    if not path.exists():
+        files = esc_noise_files()
+        if len(files) < ESC_NOISE_CLIPS:
+            raise FileNotFoundError(f"need the full ESC-50 audio in {ESC_ROOT / 'audio'}, found only {len(files)} non-ESC-10 clips")
+        CACHE.mkdir(exist_ok=True)
+        pick = np.random.default_rng(seed).choice(len(files), ESC_NOISE_CLIPS, replace=False)
+        np.save(path, np.stack([fix_length(load_wav(files[i]), 5 * SR) for i in pick]))
+    return np.load(path)
+
+
+# random crop of a noise bank that is not silent
+def esc_crop(bank, n, rng):
+    for _ in range(50):
+        clip = bank[rng.integers(len(bank))]
+        start = rng.integers(0, bank.shape[1] - n + 1)
+        crop = clip[start : start + n]
+        if (crop**2).mean() > 1e-6:
+            break
+    return crop
+
+
 # function to add noise to data
 def add_noise(X, kind, snr_db, seed=0):
     rng = np.random.default_rng(seed)
     n_clips, n = X.shape
     if kind == "white":
         noise = rng.standard_normal((n_clips, n)).astype(np.float32)
+    elif kind == "esc":
+        bank = esc_noise_bank()
+        noise = np.stack([esc_crop(bank, n, rng) for _ in range(n_clips)])
     else:
         files = [load_wav(SC_ROOT / "_background_noise_" / f"{f}.wav") for f in REAL_NOISE]
         crops = []
@@ -121,7 +157,7 @@ def add_noise(X, kind, snr_db, seed=0):
         noise = np.stack(crops)
     voiced = np.abs(X) > 1e-4
     signal_power = (X**2 * voiced).sum(1) / np.maximum(voiced.sum(1), 1)
-    noise_power = (noise**2).mean(1)
+    noise_power = np.maximum((noise**2).mean(1), 1e-12)
     scale = np.sqrt(signal_power / (10 ** (snr_db / 10) * noise_power))
     return (X + scale[:, None] * noise).astype(np.float32)
 
@@ -132,6 +168,28 @@ def apply_condition(X, condition):
         return X
     kind, snr = condition.split("_")
     return add_noise(X, kind, int(snr))
+
+
+# random noise at a random snr for each training batch (white or real)
+def make_augment(low=0, high=20, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    bank = [torch.from_numpy(load_wav(SC_ROOT / "_background_noise_" / f"{f}.wav")) for f in REAL_NOISE]
+
+    def augment(x):
+        n_clips, n = x.shape
+        noise = torch.randn(n_clips, n, generator=gen)
+        for i in torch.where(torch.rand(n_clips, generator=gen) < 0.5)[0]:
+            f = bank[int(torch.randint(len(bank), (1,), generator=gen))]
+            start = int(torch.randint(0, len(f) - n, (1,), generator=gen))
+            noise[i] = f[start : start + n]
+        snr = low + (high - low) * torch.rand(n_clips, generator=gen)
+        voiced = (x.abs() > 1e-4).float()
+        signal_power = (x**2 * voiced).sum(1) / voiced.sum(1).clamp(min=1)
+        noise_power = (noise**2).mean(1).clamp(min=1e-12)
+        scale = torch.sqrt(signal_power / (10 ** (snr / 10) * noise_power))
+        return x + scale[:, None] * noise
+
+    return augment
 
 
 # log-mel spectrogram

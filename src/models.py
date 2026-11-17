@@ -139,7 +139,7 @@ def predict_net(model, X, device, batch_size=32):
 
 
 # train any network, not RF
-def train_net(name, train, val, dataset, seed, epochs=None):
+def train_net(name, train, val, dataset, seed, epochs=None, augment=None):
     X_train, y_train = train
     X_val, y_val = val
     torch.manual_seed(seed)
@@ -166,6 +166,8 @@ def train_net(name, train, val, dataset, seed, epochs=None):
     for epoch in range(epochs):
         model.train()
         for x, y in loader:
+            if augment is not None:
+                x = augment(x)
             loss = F.cross_entropy(model(x.to(DEVICE)), y.to(DEVICE))
             optimizer.zero_grad()
             loss.backward()
@@ -189,7 +191,7 @@ def train_net(name, train, val, dataset, seed, epochs=None):
 
 
 # train any model
-def train_model(name, train, val, dataset, seed, epochs=None):
+def train_model(name, train, val, dataset, seed, epochs=None, augment=None):
     if name == "rf":
         return train_rf(train, val, dataset, seed)
-    return train_net(name, train, val, dataset, seed, epochs)
+    return train_net(name, train, val, dataset, seed, epochs, augment)
