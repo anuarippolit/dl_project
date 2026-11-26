@@ -7,7 +7,7 @@ from scipy.special import softmax
 
 import metrics
 from data import CONDITIONS, ROOT, apply_condition, get_split
-from models import train_model
+from models import predict, train_model
 
 RESULTS = ROOT / "results"
 DATASETS = ["esc10", "sc", "sc_small"]
@@ -16,17 +16,15 @@ SEEDS = [0]
 RELIABILITY_CONDITIONS = ["clean", "white_0", "real_0"]
 
 
-# function to measure time per clip
-def latency_ms(predict, X, runs=20):
-    predict(X[:1], cpu=True)
+def latency_ms(model, X, runs=20):
+    predict(model, X[:1], cpu=True)
     start = time.time()
     for _ in range(runs):
-        predict(X[:1], cpu=True)
+        predict(model, X[:1], cpu=True)
     return (time.time() - start) / runs * 1000
 
 
-# function to run one experiment
-def run_experiment(dataset, model, seed, epochs):
+def run_experiment(dataset, model_name, seed, epochs):
     folds = [1, 2, 3, 4, 5] if dataset == "esc10" else [1]
     logits = {c: [] for c in CONDITIONS + ["val"]}
     y_test, y_val, cost = [], [], []
@@ -34,14 +32,15 @@ def run_experiment(dataset, model, seed, epochs):
     for fold in folds:
         print(f"  fold {fold}", flush=True)
         train, val, test = get_split(dataset, fold, seed)
-        predict, info = train_model(model, train, val, dataset, seed, epochs)
+        model, info = train_model(model_name, train, val, dataset, seed, epochs)
         for condition in CONDITIONS:
-            logits[condition].append(predict(apply_condition(test[0], condition)))
-        logits["val"].append(predict(val[0]))
+            logits[condition].append(predict(model, apply_condition(test[0], condition)))
+        logits["val"].append(predict(model, val[0]))
         y_test.append(test[1])
         y_val.append(val[1])
-        info["latency_ms"] = latency_ms(predict, test[0])
-        cost.append({"dataset": dataset, "model": model, "seed": seed, "fold": fold, **info})
+        info["latency_ms"] = latency_ms(model, test[0])
+        info.update({"dataset": dataset, "model": model_name, "seed": seed, "fold": fold})
+        cost.append(info)
 
     logits = {c: np.concatenate(v) for c, v in logits.items()}
     y_test, y_val = np.concatenate(y_test), np.concatenate(y_val)
@@ -49,23 +48,25 @@ def run_experiment(dataset, model, seed, epochs):
     temperature = metrics.fit_temperature(logits["val"], y_val)
     scores, bins = [], []
     for condition in CONDITIONS:
-        row = {"dataset": dataset, "model": model, "seed": seed, "condition": condition}
-        scores.append({**row, **metrics.evaluate(logits[condition], y_test, temperature)})
+        row = {"dataset": dataset, "model": model_name, "seed": seed, "condition": condition}
+        score = dict(row)
+        score.update(metrics.evaluate(logits[condition], y_test, temperature))
+        scores.append(score)
         if condition in RELIABILITY_CONDITIONS:
             table = metrics.reliability(softmax(logits[condition], axis=1), y_test)
             for i, (weight, conf, acc) in enumerate(table):
-                bins.append({**row, "bin": i, "weight": weight, "confidence": conf, "accuracy": acc})
+                bin_row = dict(row)
+                bin_row.update({"bin": i, "weight": weight, "confidence": conf, "accuracy": acc})
+                bins.append(bin_row)
     print(f"  clean acc {scores[0]['acc']:.3f}", flush=True)
     return scores, bins, cost
 
 
-# function to read a results file if it exists
 def read_csv(name):
     path = RESULTS / name
     return pd.read_csv(path) if path.exists() else pd.DataFrame()
 
 
-# main
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", default=DATASETS)

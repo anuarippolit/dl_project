@@ -1,3 +1,7 @@
+import os
+
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import time
 
 import numpy as np
@@ -11,8 +15,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchaudio.transforms import FrequencyMasking, TimeMasking
 from transformers import Wav2Vec2Model
 
-from data import SR, LogMel
+from data import ALL_CONDITIONS, ROOT, SR, LogMel, add_train_noise, apply_condition, esc_noise_bank, get_split, load_noise_bank
 
+LOGITS = ROOT / "results" / "extra_logits"
+MODELS = ["rf", "cnn", "resnet", "wav2vec"]
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 BACKBONE_LR = {"cnn": 1e-3, "resnet": 1e-4, "wav2vec": 3e-5}
@@ -31,11 +37,9 @@ EPOCHS = {
 }
 
 
-# random forest
 mfcc = torchaudio.transforms.MFCC(SR, n_mfcc=20, melkwargs={"n_fft": 1024, "hop_length": 160, "n_mels": 64})
 
 
-# function to turn clips into MFCC features
 def mfcc_features(X, batch_size=256):
     rows = []
     for i in range(0, len(X), batch_size):
@@ -47,21 +51,14 @@ def mfcc_features(X, batch_size=256):
     return torch.cat(rows).numpy()
 
 
-# train RF
-def train_rf(train, val, dataset, seed, epochs=None):
+def train_rf(train, seed):
     X_train, y_train = train
     start = time.time()
     forest = RandomForestClassifier(n_estimators=300, n_jobs=-1, random_state=seed)
     forest.fit(mfcc_features(X_train), y_train)
-    train_seconds = time.time() - start
-
-    def predict(X, cpu=False):
-        return np.log(forest.predict_proba(mfcc_features(X)) + 1e-6)
-
-    return predict, {"params": 0, "train_seconds": train_seconds}
+    return forest, {"params": 0, "train_seconds": time.time() - start}
 
 
-# CNN
 def cnn_body():
     layers, in_channels = [], 1
     for out_channels in (32, 64, 128, 128):
@@ -70,14 +67,12 @@ def cnn_body():
     return nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten())
 
 
-# ResNet18 using already existing resnet18 model from torchvision
 def resnet_body():
     resnet = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
     resnet.fc = nn.Identity()
     return resnet
 
 
-# waveform to log-mel to cnn or resnet
 class SpecBackbone(nn.Module):
 
     def __init__(self, body, channels):
@@ -96,7 +91,6 @@ class SpecBackbone(nn.Module):
         return self.body(x.expand(-1, self.channels, -1, -1))
 
 
-# wav2vec2
 class Wav2VecBackbone(nn.Module):
     def __init__(self):
         super().__init__()
@@ -108,7 +102,6 @@ class Wav2VecBackbone(nn.Module):
         return self.model(wav).last_hidden_state.mean(1)
 
 
-# backbone with a classification head
 class Net(nn.Module):
     def __init__(self, backbone, dim, n_classes=10):
         super().__init__()
@@ -119,7 +112,6 @@ class Net(nn.Module):
         return self.head(self.backbone(wav))
 
 
-# fNetwork builder
 def build_net(name):
     if name == "cnn":
         return Net(SpecBackbone(cnn_body(), 1), 128)
@@ -128,8 +120,8 @@ def build_net(name):
     return Net(Wav2VecBackbone(), 768)
 
 
-# prediction func
 def predict_net(model, X, device, batch_size=32):
+    model.to(device)
     model.eval()
     outputs = []
     with torch.no_grad():
@@ -138,8 +130,13 @@ def predict_net(model, X, device, batch_size=32):
     return torch.cat(outputs).numpy()
 
 
-# train any network, not RF
-def train_net(name, train, val, dataset, seed, epochs=None, augment=None):
+def predict(model, X, cpu=False):
+    if isinstance(model, RandomForestClassifier):
+        return np.log(model.predict_proba(mfcc_features(X)) + 1e-6)
+    return predict_net(model, X, "cpu" if cpu else DEVICE)
+
+
+def train_net(name, train, val, dataset, seed, epochs=None, noise_train=False):
     X_train, y_train = train
     X_val, y_val = val
     torch.manual_seed(seed)
@@ -161,13 +158,17 @@ def train_net(name, train, val, dataset, seed, epochs=None, augment=None):
         drop_last=True,
     )
 
+    if noise_train:
+        bank = load_noise_bank()
+        gen = torch.Generator().manual_seed(seed)
+
     best_loss, best_state = float("inf"), None
     start = time.time()
     for epoch in range(epochs):
         model.train()
         for x, y in loader:
-            if augment is not None:
-                x = augment(x)
+            if noise_train:
+                x = add_train_noise(x, bank, gen)
             loss = F.cross_entropy(model(x.to(DEVICE)), y.to(DEVICE))
             optimizer.zero_grad()
             loss.backward()
@@ -181,17 +182,32 @@ def train_net(name, train, val, dataset, seed, epochs=None, augment=None):
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     train_seconds = time.time() - start
     model.load_state_dict(best_state)
-
-    def predict(X, cpu=False):
-        device = "cpu" if cpu else DEVICE
-        model.to(device)
-        return predict_net(model, X, device)
-
-    return predict, {"params": sum(p.numel() for p in model.parameters()), "train_seconds": train_seconds}
+    return model, {"params": sum(p.numel() for p in model.parameters()), "train_seconds": train_seconds}
 
 
-# train any model
-def train_model(name, train, val, dataset, seed, epochs=None, augment=None):
+def train_model(name, train, val, dataset, seed, epochs=None, noise_train=False):
     if name == "rf":
-        return train_rf(train, val, dataset, seed)
-    return train_net(name, train, val, dataset, seed, epochs, augment)
+        return train_rf(train, seed)
+    return train_net(name, train, val, dataset, seed, epochs, noise_train)
+
+
+def fold_logits(dataset, model_name, seed, fold, epochs, noise_train, tag):
+    path = LOGITS / f"{tag}_{dataset}_{model_name}_{seed}_f{fold}.npz"
+    if path.exists():
+        return dict(np.load(path))
+    LOGITS.mkdir(parents=True, exist_ok=True)
+    train, val, test = get_split(dataset, fold, seed)
+    model, _ = train_model(model_name, train, val, dataset, seed, epochs, noise_train)
+    out = {"y_test": test[1], "y_val": val[1]}
+    for condition in ALL_CONDITIONS:
+        out["test_" + condition] = predict(model, apply_condition(test[0], condition))
+        out["val_" + condition] = predict(model, apply_condition(val[0], condition))
+    np.savez_compressed(path, **out)
+    return out
+
+
+def get_logits(dataset, model_name, seed=0, epochs=None, noise_train=False, tag="base"):
+    esc_noise_bank()
+    folds = [1, 2, 3, 4, 5] if dataset == "esc10" else [1]
+    parts = [fold_logits(dataset, model_name, seed, fold, epochs, noise_train, tag) for fold in folds]
+    return {key: np.concatenate([p[key] for p in parts]) for key in parts[0]}

@@ -1,3 +1,7 @@
+import os
+
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +23,11 @@ SECONDS = {"esc10": 5, "sc": 1}
 SNRS = [20, 10, 0]
 CONDITIONS = ["clean"] + [f"{kind}_{snr}" for kind in ("white", "real") for snr in SNRS]
 EXTRA_CONDITIONS = [f"esc_{snr}" for snr in SNRS]
+ALL_CONDITIONS = CONDITIONS + EXTRA_CONDITIONS
 REAL_NOISE = ["doing_the_dishes", "dude_miaowing", "exercise_bike", "running_tap"]
 ESC_NOISE_CLIPS = 300
 
 
-# function to load one wav file at 16 kHz
 def load_wav(path):
     x, sr = sf.read(str(path), dtype="float32")
     if x.ndim > 1:
@@ -33,14 +37,12 @@ def load_wav(path):
     return x
 
 
-# cut or pad a clip to a fixed length
 def fix_length(x, n):
     if len(x) < n:
         return np.pad(x, (0, n - len(x)))
     return x[:n]
 
 
-# function to describe ESC-10 clips with labels and folds
 def esc10_table():
     df = pd.read_csv(ESC_ROOT / "meta" / "esc50.csv")
     df = df[df.esc10].copy()
@@ -51,7 +53,6 @@ def esc10_table():
     return df[["path", "label", "group", "category"]].reset_index(drop=True)
 
 
-# function to list Speech Commands clips with labels and splits
 def sc_table():
     val = set((SC_ROOT / "validation_list.txt").read_text().split())
     test = set((SC_ROOT / "testing_list.txt").read_text().split())
@@ -64,7 +65,6 @@ def sc_table():
     return pd.DataFrame(rows, columns=["path", "label", "group", "category"])
 
 
-# load data
 def load_dataset(name):
     CACHE.mkdir(exist_ok=True)
     x_path = CACHE / f"{name}_X.npy"
@@ -80,7 +80,6 @@ def load_dataset(name):
     return X, meta.label.values, meta.group.values
 
 
-# func to pick equal number of clips per class
 def stratified(y, idx, n, seed):
     rng = np.random.default_rng(seed)
     classes = np.unique(y)
@@ -88,7 +87,6 @@ def stratified(y, idx, n, seed):
     return np.sort(np.concatenate(keep))
 
 
-# spliting data
 def get_split(name, fold=1, seed=0):
     small = name == "sc_small"
     if small:
@@ -107,14 +105,12 @@ def get_split(name, fold=1, seed=0):
     return [(np.array(X[i]), y[i].astype(np.int64)) for i in (train, val, test)]
 
 
-# ESC-50 clips from classes that are not in ESC-10 (audio must be downloaded)
 def esc_noise_files():
     df = pd.read_csv(ESC_ROOT / "meta" / "esc50.csv")
     df = df[~df.esc10]
     return [ESC_ROOT / "audio" / f for f in df.filename if (ESC_ROOT / "audio" / f).exists()]
 
 
-# bank of noise clips from ESC-50 classes that are not in ESC-10
 def esc_noise_bank(seed=0):
     path = CACHE / "esc_noise.npy"
     if not path.exists():
@@ -127,7 +123,6 @@ def esc_noise_bank(seed=0):
     return np.load(path)
 
 
-# random crop of a noise bank that is not silent
 def esc_crop(bank, n, rng):
     for _ in range(50):
         clip = bank[rng.integers(len(bank))]
@@ -138,7 +133,6 @@ def esc_crop(bank, n, rng):
     return crop
 
 
-# function to add noise to data
 def add_noise(X, kind, snr_db, seed=0):
     rng = np.random.default_rng(seed)
     n_clips, n = X.shape
@@ -162,7 +156,6 @@ def add_noise(X, kind, snr_db, seed=0):
     return (X + scale[:, None] * noise).astype(np.float32)
 
 
-# function to apply a noise condition to clips
 def apply_condition(X, condition):
     if condition == "clean":
         return X
@@ -170,29 +163,26 @@ def apply_condition(X, condition):
     return add_noise(X, kind, int(snr))
 
 
-# random noise at a random snr for each training batch (white or real)
-def make_augment(low=0, high=20, seed=0):
-    gen = torch.Generator().manual_seed(seed)
-    bank = [torch.from_numpy(load_wav(SC_ROOT / "_background_noise_" / f"{f}.wav")) for f in REAL_NOISE]
+def load_noise_bank():
+    return [torch.from_numpy(load_wav(SC_ROOT / "_background_noise_" / f"{f}.wav")) for f in REAL_NOISE]
 
-    def augment(x):
-        n_clips, n = x.shape
-        noise = torch.randn(n_clips, n, generator=gen)
-        for i in torch.where(torch.rand(n_clips, generator=gen) < 0.5)[0]:
+
+def add_train_noise(x, bank, gen):
+    n_clips, n = x.shape
+    noise = torch.randn(n_clips, n, generator=gen)
+    for i in range(n_clips):
+        if torch.rand(1, generator=gen) < 0.5:
             f = bank[int(torch.randint(len(bank), (1,), generator=gen))]
             start = int(torch.randint(0, len(f) - n, (1,), generator=gen))
             noise[i] = f[start : start + n]
-        snr = low + (high - low) * torch.rand(n_clips, generator=gen)
-        voiced = (x.abs() > 1e-4).float()
-        signal_power = (x**2 * voiced).sum(1) / voiced.sum(1).clamp(min=1)
-        noise_power = (noise**2).mean(1).clamp(min=1e-12)
-        scale = torch.sqrt(signal_power / (10 ** (snr / 10) * noise_power))
-        return x + scale[:, None] * noise
-
-    return augment
+    snr = 20 * torch.rand(n_clips, generator=gen)
+    voiced = (x.abs() > 1e-4).float()
+    signal_power = (x**2 * voiced).sum(1) / voiced.sum(1).clamp(min=1)
+    noise_power = (noise**2).mean(1).clamp(min=1e-12)
+    scale = torch.sqrt(signal_power / (10 ** (snr / 10) * noise_power))
+    return x + scale[:, None] * noise
 
 
-# log-mel spectrogram
 class LogMel(torch.nn.Module):
     def __init__(self, n_mels=64, n_fft=1024, hop=160):
         super().__init__()

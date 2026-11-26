@@ -2,8 +2,6 @@ data/
 .venv/
 __pycache__/
 .DS_Store
-presentation/
-presentation.zip
 results/extra_logits/
 results/extra_logits_quick/
 results/figures_quick/

@@ -4,12 +4,10 @@ from scipy.special import softmax
 from sklearn.metrics import f1_score
 
 
-# share of correct predictions
 def accuracy(probs, y):
     return (probs.argmax(1) == y).mean()
 
 
-# confidence vs accuracy in 10 confidence bins
 def reliability(probs, y, bins=10):
     conf = probs.max(1)
     correct = probs.argmax(1) == y
@@ -24,7 +22,6 @@ def reliability(probs, y, bins=10):
     return np.array(rows)
 
 
-# expected calibration error: gap between confidence and accuracy
 def ece(probs, y, bins=10):
     table = reliability(probs, y, bins)
     weight, conf, acc = table[:, 0], table[:, 1], table[:, 2]
@@ -32,21 +29,19 @@ def ece(probs, y, bins=10):
     return (weight[keep] * np.abs(conf[keep] - acc[keep])).sum()
 
 
-# negative log likelihood of the true class
 def nll(probs, y):
     return -np.log(probs[np.arange(len(y)), y] + 1e-12).mean()
 
 
-# find temperature that minimises nll on validation logits
-def fit_temperature(logits, y):
-    def loss(log_t):
-        return nll(softmax(logits / np.exp(log_t), axis=1), y)
+def temperature_loss(log_t, logits, y):
+    return nll(softmax(logits / np.exp(log_t), axis=1), y)
 
-    result = minimize_scalar(loss, bounds=(-3, 3), method="bounded")
+
+def fit_temperature(logits, y):
+    result = minimize_scalar(temperature_loss, bounds=(-3, 3), args=(logits, y), method="bounded")
     return float(np.exp(result.x))
 
 
-# function to compute all metrics
 def evaluate(logits, y, temperature):
     probs = softmax(logits, axis=1)
     scaled = softmax(logits / temperature, axis=1)
